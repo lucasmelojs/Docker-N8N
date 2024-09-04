@@ -1,8 +1,15 @@
-FROM n8nio/n8n
+FROM node
 
-RUN apt-get update && apt-get install -y postgresql-client
+WORKDIR /usr/src/app
 
-COPY wait-for-it.sh /wait-for-it.sh
-RUN chmod +x /wait-for-it.sh
+COPY package.json .
 
-CMD ["/bin/sh", "-c", "/wait-for-it.sh postgres:5432 -- /wait-for-it.sh redis:6379 -- npm start"]
+RUN npm install
+
+RUN npm start
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["node", "index.js"]

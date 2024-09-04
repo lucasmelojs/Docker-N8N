@@ -1,40 +1,136 @@
 version: "3.8"
 
-services:
-  n8n:
-    image: n8nio/n8n
-    ports:
-      - "5678:5678"
-    environment:
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=containers-us-west-XX.railway.app
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=pools
-      - DB_POSTGRESDB_USER=lucasadmin
-      - DB_POSTGRESDB_PASSWORD=a6da6%82#sS*!DA0
-      - N8N_REDIS_HOST=redis
-      - WEBHOOK_URL=postgres://lucasadmin:a6da6%82#sS*!DA0@containers-us-west-XX.railway.app:5432/pools
+volumes:
+  db_storage:
+  n8n_storage:
+  redis_storage:
+  traefik_letsencrypt: # Volume for storing Let's Encrypt certificates
 
-    depends_on:
-      - postgres
-      - redis
+x-shared: &shared
+  restart: always
+  image: docker.n8n.io/n8nio/n8n
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=postgres
+    - DB_POSTGRESDB_PORT=5432
+    - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+    - DB_POSTGRESDB_USER=${POSTGRES_NON_ROOT_USER}
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
+    - EXECUTIONS_MODE=queue
+    - QUEUE_BULL_REDIS_HOST=redis
+    - QUEUE_HEALTH_CHECK_ACTIVE=true
+  links:
+    - postgres
+    - redis
+  volumes:
+    - n8n_storage:/home/node/.n8n
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  traefik:
+    image: traefik:v2.10
+    command:
+      - "--api.insecure=true" # Access to the Traefik dashboard (not recommended in production without additional security)
+      - "--providers.docker=true" # Enable Docker provider to auto-discover services
+      - "--entrypoints.web.address=:80" # HTTP entrypoint
+      - "--entrypoints.websecure.address=:443" # HTTPS entrypoint
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true" # TLS challenge for Let's Encrypt
+      - "--certificatesresolvers.myresolver.acme.email=lucascunhamelo@gmail.com" # Your email for Let's Encrypt notifications
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json" # Storage for certificates
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro" # Required for Traefik to interact with Docker
+      - "traefik_letsencrypt:/letsencrypt" # Volume for Let's Encrypt certificates
+    networks:
+      - web
 
   postgres:
-    image: bitnami/postgresql:latest
+    image: postgres:16
+    restart: always
     environment:
-      - POSTGRESQL_DATABASE=pools
-      - POSTGRESQL_USERNAME=lucasadmin
-      - POSTGRESQL_PASSWORD=a6da6%82#sS*!DA0
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB
+      - POSTGRES_NON_ROOT_USER
+      - POSTGRES_NON_ROOT_PASSWORD
     volumes:
-      - postgres_data:/bitnami/postgresql
+      - db_storage:/var/lib/postgresql/data
+      - ./init-data.sh:/docker-entrypoint-initdb.d/init-data.sh
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
 
   redis:
-    image: bitnami/redis:latest
-    environment:
-      - REDIS_PASSWORD=a6da6%82#sS*!DA0
+    image: redis:6-alpine
+    restart: always
     volumes:
-      - redis_data:/bitnami/redis
+      - redis_storage:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
 
-volumes:
-  postgres_data:
-  redis_data:
+  n8n:
+    <<: *shared
+    ports:
+      - 5678:5678
+    environment:
+      - N8N_TEMPLATES_ENABLED=false
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`buyquickly.shop`)" # Replace with your domain
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678" # Port on which n8n is listening
+    networks:
+      - web
+      - internal
+
+  n8n-worker:
+    <<: *shared
+    command: worker
+    environment:
+      - N8N_TEMPLATES_ENABLED=false
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    depends_on:
+      - n8n
+    networks:
+      - internal
+
+  node:
+    image: node:16
+    restart: always
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: npm start
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    networks:
+      - internal
+
+networks:
+  web:
+    external: true
+  internal:
+    external: false
